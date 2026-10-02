@@ -33,6 +33,8 @@ class AnalysisState:
 
     # ── File paths ───────────────────────────────────────────────────────
     filament_ref_path: str = ""
+    filament_set: str = "legacy"
+    custom_filaments_path: str = ""
     data_file_path: str = ""
     metadata_file_path: str = ""
     output_dir: str = ""
@@ -335,5 +337,4 @@ class AnalysisState:
         """Load session from a JSON file."""
         text = Path(path).read_text(encoding="utf-8")
         return cls.from_json(text)
-
 

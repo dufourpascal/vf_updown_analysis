@@ -6,8 +6,6 @@ Provides column mapping dropdowns and threshold computation.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -34,7 +32,7 @@ from ..core.data_loader import (
     validate_data_columns,
     validate_metadata_columns,
 )
-from ..core.vf_threshold import compute_thresholds_batch, load_filament_reference
+from ..core.vf_threshold import compute_thresholds_batch, get_delta, load_filament_reference
 from .state import AnalysisState
 
 
@@ -71,6 +69,9 @@ class ThresholdWorker(QThread):
                 filament_col=self.filament_col,
                 log_column=self.log_column,
             )
+            self.df["vf_filament_set"] = self.filament_info.attrs.get("filament_set", "legacy")
+            self.df["vf_log_column"] = self.log_column
+            self.df["vf_delta"] = get_delta(self.filament_info, self.log_column)
             self.finished.emit(self.df)
         except Exception as e:
             self.error.emit(str(e))
@@ -94,6 +95,31 @@ class DataInputPanel(QWidget):
         filament_group = QGroupBox("Filament Reference File (required)")
         fg_layout = QVBoxLayout(filament_group)
 
+        set_row = QHBoxLayout()
+        set_row.addWidget(QLabel("Filament set:"))
+        self.filament_set_combo = QComboBox()
+        self.filament_set_combo.addItem("Legacy mouse (unchanged)", "legacy")
+        self.filament_set_combo.addItem("Rat — NIH handle codes (approx. 0.4–15 g)", "rat")
+        self.filament_set_combo.addItem("Custom calibrated ladder (CSV)", "custom")
+        set_row.addWidget(self.filament_set_combo)
+        fg_layout.addLayout(set_row)
+
+        custom_row = QHBoxLayout()
+        self.custom_path_edit = QLineEdit()
+        self.custom_path_edit.setReadOnly(True)
+        self.custom_path_edit.setPlaceholderText("CSV: Filament_number, Force (g), optional Log")
+        self.custom_browse_btn = QPushButton("Browse ladder...")
+        self.custom_browse_btn.clicked.connect(self._browse_custom_filaments)
+        custom_row.addWidget(self.custom_path_edit)
+        custom_row.addWidget(self.custom_browse_btn)
+        fg_layout.addLayout(custom_row)
+        self.ladder_note = QLabel(
+            "Use the complete ladder used in the experiment; IDs must match last_filament. "
+            "Rat/custom sets use a mean-spacing Dixon approximation. See docs/filament_sets.md."
+        )
+        self.ladder_note.setWordWrap(True)
+        fg_layout.addWidget(self.ladder_note)
+
         row = QHBoxLayout()
         self.filament_path_edit = QLineEdit()
         self.filament_path_edit.setReadOnly(True)
@@ -111,10 +137,10 @@ class DataInputPanel(QWidget):
         log_row = QHBoxLayout()
         log_row.addWidget(QLabel("Log column:"))
         self.log_new_radio = QRadioButton("Log_new (computed)")
-        self.log_old_radio = QRadioButton("Log (from Excel)")
+        self.log_old_radio = QRadioButton("Log (reference / handle code)")
         self.log_new_radio.setChecked(True)
         self.log_new_radio.setToolTip("Use log values computed from force: log10(10 * force_g * 1000)")
-        self.log_old_radio.setToolTip("Use log values as stored in the Excel file")
+        self.log_old_radio.setToolTip("Use reference Log values from the workbook or selected ladder")
         log_row.addWidget(self.log_new_radio)
         log_row.addWidget(self.log_old_radio)
         log_row.addStretch()
@@ -195,10 +221,49 @@ class DataInputPanel(QWidget):
 
         layout.addStretch()
 
-        # Auto-load filament ref if in data/ directory
-        default_ref = Path("data/VF_Calculator_Up-down.xlsx")
-        if default_ref.exists():
-            self._load_filament_ref(str(default_ref))
+        self.filament_set_combo.currentIndexChanged.connect(self._filament_set_changed)
+        self.log_new_radio.toggled.connect(self._update_filament_status)
+        self.restore_filament_settings()
+
+    def restore_filament_settings(self) -> None:
+        """Restore profile controls and reference after loading a session."""
+        self.filament_set_combo.blockSignals(True)
+        self.filament_set_combo.setCurrentIndex(
+            self.filament_set_combo.findData(self.state.filament_set)
+        )
+        self.filament_set_combo.blockSignals(False)
+        self.custom_path_edit.setText(self.state.custom_filaments_path)
+        self.log_new_radio.blockSignals(True)
+        self.log_new_radio.setChecked(self.state.log_column == "Log_new")
+        self.log_old_radio.setChecked(self.state.log_column == "Log")
+        self.log_new_radio.blockSignals(False)
+        self._filament_set_changed()
+
+    def _filament_set_changed(self) -> None:
+        self.state.filament_set = self.filament_set_combo.currentData()
+        custom = self.state.filament_set == "custom"
+        self.custom_path_edit.setEnabled(custom)
+        self.custom_browse_btn.setEnabled(custom)
+        self._load_filament_ref(
+            self.state.filament_ref_path or "data/VF_Calculator_Up-down.xlsx"
+        )
+
+    def _browse_custom_filaments(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Select Filament Ladder", "", "CSV Files (*.csv)")
+        if path:
+            self.state.custom_filaments_path = path
+            self.custom_path_edit.setText(path)
+            self._filament_set_changed()
+
+    def _update_filament_status(self) -> None:
+        info = self.state._filament_info
+        if info is not None:
+            self.state.log_column = "Log_new" if self.log_new_radio.isChecked() else "Log"
+            delta = get_delta(info, self.state.log_column)
+            self.filament_status.setText(
+                f"Loaded ({len(info)} filaments, {len(self.state._series_stats)} series patterns); "
+                f"delta = {delta:.9f}"
+            )
 
     def _make_combo(self, label: str, parent_layout: QHBoxLayout) -> QComboBox:
         parent_layout.addWidget(QLabel(label))
@@ -216,20 +281,24 @@ class DataInputPanel(QWidget):
             self._load_filament_ref(path)
 
     def _load_filament_ref(self, path: str) -> None:
+        self.state.filament_ref_path = path
+        self.filament_path_edit.setText(path)
+        self.state._filament_info = None
+        self.state._series_stats = None
         try:
-            info, stats = load_filament_reference(path)
+            info, stats = load_filament_reference(
+                path, filament_set=self.state.filament_set,
+                custom_filaments=(self.state.custom_filaments_path
+                                  if self.state.filament_set == "custom" else None),
+            )
             self.state._filament_info = info
             self.state._series_stats = stats
-            self.state.filament_ref_path = path
-            self.filament_path_edit.setText(path)
-            n_filaments = len(info)
-            n_series = len(stats)
-            self.filament_status.setText(f"Loaded ({n_filaments} filaments, {n_series} series patterns)")
+            self._update_filament_status()
             self.filament_status.setStyleSheet("color: green;")
-            self._check_ready()
         except Exception as e:
             self.filament_status.setText(f"Error: {e}")
             self.filament_status.setStyleSheet("color: red;")
+        self._check_ready()
 
     def _browse_data_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(

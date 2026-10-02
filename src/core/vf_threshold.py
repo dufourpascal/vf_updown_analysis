@@ -8,7 +8,7 @@ The threshold is computed as:
 Where:
     Xf = log value of the final filament
     k  = tabulated statistic based on the x/o series pattern
-    delta = mean log interval between filaments (0.441428571)
+    delta = mean log interval between filaments (profile-specific)
 """
 
 from __future__ import annotations
@@ -25,6 +25,55 @@ DELTA_INTERVAL: float = 0.441428571
 
 # Default starting filament number
 INITIAL_FILAMENT: int = 4
+
+FILAMENT_SETS = ("legacy", "rat", "custom")
+RAT_REFERENCE = Path(__file__).resolve().parents[2] / "data" / "filaments_rat.csv"
+
+
+def load_filament_set(filepath: Union[str, Path]) -> pd.DataFrame:
+    """Read a CSV containing the complete ordered ladder used in an experiment.
+
+    IDs are positive integers, unique but not necessarily consecutive. Forces
+    must increase in row order. Optional Log values are handle codes, whereas
+    Log_new is calculated from Force (g) without legacy rounding.
+    """
+    info = pd.read_csv(filepath)
+    required = {"Filament_number", "Force (g)"}
+    if not required.issubset(info.columns):
+        raise ValueError(f"Filament CSV must contain columns: {sorted(required)}")
+    if len(info) < 2:
+        raise ValueError("A filament ladder must contain at least two filaments.")
+    ids = pd.to_numeric(info["Filament_number"], errors="raise")
+    if (not np.isfinite(ids).all() or (ids <= 0).any()
+            or (ids != np.floor(ids)).any() or ids.duplicated().any()):
+        raise ValueError("Filament numbers must be unique positive integers.")
+    info["Filament_number"] = ids.astype(int)
+    forces = pd.to_numeric(info["Force (g)"], errors="raise")
+    if (not np.isfinite(forces).all() or (forces <= 0).any()
+            or (np.diff(forces) <= 0).any()):
+        raise ValueError("Forces must be finite, positive, and increasing in CSV row order.")
+    info["Force (g)"] = forces
+    info["Log_new"] = np.log10(forces * 10000)
+    if "Log" not in info:
+        info["Log"] = info["Log_new"]
+    logs = pd.to_numeric(info["Log"], errors="raise")
+    if not np.isfinite(logs).all() or (np.diff(logs) <= 0).any():
+        raise ValueError("Log values must be finite and increasing in CSV row order.")
+    info["Log"] = logs
+    info.attrs["delta_mode"] = "mean"
+    return info
+
+
+def get_delta(filament_info: pd.DataFrame, log_column: str = "Log_new") -> float:
+    """Keep the historical interval unless an explicit ladder was loaded."""
+    if filament_info.attrs.get("delta_mode") != "mean":
+        return DELTA_INTERVAL
+    if log_column not in filament_info:
+        raise ValueError(f"Log column '{log_column}' not found in filament info.")
+    intervals = np.diff(filament_info[log_column].to_numpy(dtype=float))
+    if not len(intervals) or not np.isfinite(intervals).all() or (intervals <= 0).any():
+        raise ValueError("Filament logs must be finite and strictly increasing.")
+    return float(intervals.mean())
 
 
 def calculate_log(force_grams: float) -> float:
@@ -44,12 +93,18 @@ def calculate_log(force_grams: float) -> float:
 def load_filament_reference(
     filepath: Union[str, Path],
     sheet_name: str = "values_analysis",
+    *,
+    filament_set: str = "legacy",
+    custom_filaments: Union[str, Path, None] = None,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """Load filament reference data and series statistics from the VF Calculator file.
 
     Args:
         filepath: Path to VF_Calculator_Up-down.xlsx.
         sheet_name: Name of the sheet containing values_analysis data.
+        filament_set: 'legacy' (unchanged workbook), 'rat', or 'custom'.
+        custom_filaments: CSV ladder required for 'custom'; k values still
+            come from the unmodified workbook.
 
     Returns:
         Tuple of (filament_info DataFrame, series_statistics dict).
@@ -58,6 +113,12 @@ def load_filament_reference(
         FileNotFoundError: If the file does not exist.
         ValueError: If required columns are missing.
     """
+    if filament_set not in FILAMENT_SETS:
+        raise ValueError(f"Unknown filament set: {filament_set}")
+    if filament_set == "custom" and not custom_filaments:
+        raise ValueError("Custom filament set requires a filament CSV path.")
+    if filament_set != "custom" and custom_filaments:
+        raise ValueError("A custom filament CSV can only be used with the custom set.")
     filepath = Path(filepath)
     if not filepath.exists():
         raise FileNotFoundError(f"Filament reference file not found: {filepath}")
@@ -77,6 +138,11 @@ def load_filament_reference(
     observations = df_obs_statistics["OBSERVATION"].tolist()
     statistics = df_obs_statistics["STATISTIC"].tolist()
     dict_obs_stat: dict[str, float] = dict(zip(observations, statistics))
+
+    if filament_set != "legacy":
+        info = load_filament_set(RAT_REFERENCE if filament_set == "rat" else custom_filaments)
+        info.attrs["filament_set"] = filament_set
+        return info, dict_obs_stat
 
     # Load filament information (columns G:K, 8 rows of filament data)
     df_filament_info = pd.read_excel(
@@ -105,7 +171,7 @@ def compute_50_threshold(
     filament_info: pd.DataFrame,
     series_statistics: dict[str, float],
     log_column: str = "Log_new",
-    delta: float = DELTA_INTERVAL,
+    delta: float | None = None,
 ) -> float:
     """Compute the 50% withdrawal threshold for a single observation.
 
@@ -116,11 +182,16 @@ def compute_50_threshold(
             and the specified log_column).
         series_statistics: Dict mapping uppercase series patterns to k statistics.
         log_column: Which log column to use ('Log_new' or 'Log').
-        delta: Mean log interval between filaments.
+        delta: Override the mean log interval. None selects the loaded ladder's
+            mean interval, or the historical constant for legacy inputs.
 
     Returns:
         The 50% withdrawal threshold in grams, or NaN if series is invalid.
     """
+    if delta is None:
+        delta = get_delta(filament_info, log_column)
+    if not np.isfinite(delta) or delta <= 0:
+        raise ValueError("Delta must be finite and positive.")
     if not isinstance(series, str) or len(series) == 0:
         return np.nan
 
@@ -162,6 +233,7 @@ def compute_thresholds_batch(
     series_col: str = "xo_series",
     filament_col: str = "last_filament",
     log_column: str = "Log_new",
+    delta: float | None = None,
 ) -> pd.Series:
     """Compute 50% thresholds for all rows in a DataFrame.
 
@@ -172,10 +244,15 @@ def compute_thresholds_batch(
         series_col: Column name containing xo series strings.
         filament_col: Column name containing last filament numbers.
         log_column: Which log column to use.
+        delta: Optional override; otherwise resolved from the filament set.
 
     Returns:
         A pandas Series of threshold values aligned with df's index.
     """
+    if delta is None:
+        delta = get_delta(filament_info, log_column)
+    if not np.isfinite(delta) or delta <= 0:
+        raise ValueError("Delta must be finite and positive.")
     return df.apply(
         lambda row: compute_50_threshold(
             series=row[series_col],
@@ -183,6 +260,7 @@ def compute_thresholds_batch(
             filament_info=filament_info,
             series_statistics=series_statistics,
             log_column=log_column,
+            delta=delta,
         ),
         axis=1,
     )

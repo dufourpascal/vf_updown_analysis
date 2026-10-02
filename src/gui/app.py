@@ -224,6 +224,7 @@ class MainWindow(QMainWindow):
                 self.state = AnalysisState.load_session(path)
                 # Reinitialize panels with new state
                 self.data_panel.state = self.state
+                self.data_panel.restore_filament_settings()
                 self.group_panel.state = self.state
                 self.appearance_panel.state = self.state
                 self.preview_panel.state = self.state

@@ -33,11 +33,17 @@ Examples:
                         default="data/VF_Calculator_Up-down.xlsx",
                         help="Path to filament reference file")
     parser.add_argument("--output", type=str, default=".", help="Output directory")
+    parser.add_argument("--filament-set", choices=["legacy", "rat", "custom"],
+                        default="legacy", help="Filament ladder (default: legacy mouse set)")
+    parser.add_argument("--custom-filaments", type=str,
+                        help="CSV ladder for --filament-set custom; see docs/filament_sets.md")
     parser.add_argument("--log-column", type=str, default="Log_new",
                         choices=["Log", "Log_new"],
                         help="Which log column to use for computation")
 
     args = parser.parse_args()
+    if (args.filament_set == "custom") != bool(args.custom_filaments):
+        parser.error("--custom-filaments is required exactly when --filament-set custom is used")
 
     if args.compute:
         _run_cli(args)
@@ -58,7 +64,7 @@ def _run_cli(args: argparse.Namespace) -> None:
     import pandas as pd
 
     from .core.data_loader import load_excel_or_csv, merge_metadata
-    from .core.vf_threshold import compute_thresholds_batch, load_filament_reference
+    from .core.vf_threshold import compute_thresholds_batch, get_delta, load_filament_reference
 
     if not args.data:
         print("Error: --data is required in compute mode", file=sys.stderr)
@@ -66,7 +72,14 @@ def _run_cli(args: argparse.Namespace) -> None:
 
     # Load filament reference
     print(f"Loading filament reference: {args.filament_ref}")
-    filament_info, series_stats = load_filament_reference(args.filament_ref)
+    filament_info, series_stats = load_filament_reference(
+        args.filament_ref, filament_set=args.filament_set,
+        custom_filaments=args.custom_filaments,
+    )
+    delta = get_delta(filament_info, args.log_column)
+    print(f"Filament set: {args.filament_set}; delta: {delta:.9f}")
+    if args.filament_set != "legacy":
+        print("Using the mean-spacing Dixon approximation; the ladder must match the experiment.")
 
     # Load data
     print(f"Loading data: {args.data}")
@@ -77,6 +90,9 @@ def _run_cli(args: argparse.Namespace) -> None:
     df["threshold_50"] = compute_thresholds_batch(
         df, filament_info, series_stats, log_column=args.log_column
     )
+    df["vf_filament_set"] = args.filament_set
+    df["vf_log_column"] = args.log_column
+    df["vf_delta"] = delta
 
     # Merge metadata if provided
     if args.metadata:

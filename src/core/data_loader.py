@@ -382,6 +382,9 @@ def _reserved_data_columns(
         series_col,
         filament_col,
         "threshold_50",
+        "vf_filament_set",
+        "vf_log_column",
+        "vf_delta",
     }
 
 

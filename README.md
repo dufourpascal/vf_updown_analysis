@@ -61,6 +61,7 @@ This tool automates the threshold computation from raw response series, generate
 ## Features
 
 - **50% threshold computation** using the Dixon up-down method with tabulated k-statistics
+- **Filament sets:** unchanged legacy mouse calibration, a sourced rat reference (~0.4–15 g), or a custom calibrated CSV ladder. See [filament sets and method limits](docs/filament_sets.md).
 - **Two experimental designs supported:**
   - **Longitudinal** (3+ timepoints) — individual animal traces + group mean ± SEM line plots
   - **Factorial pre-post** (exactly 2 timepoints) — paired lines and delta plots, with
@@ -223,6 +224,12 @@ python run.py --compute \
 
 Batch mode writes `vf_thresholds.xlsx` with a `threshold_50` column; it does not run plots or statistics.
 
+For rat data, add `--filament-set rat`. For your own calibrated ladder, add
+`--filament-set custom --custom-filaments my_ladder.csv`. The GUI offers the same
+choices in Step 1. IDs in `last_filament` must match the selected ladder; see the
+[rat ID mapping, calibration sources, and custom CSV format](docs/filament_sets.md).
+Output also records the selected set, log column, and delta.
+
 ---
 
 ## Worked example: pre-post experiment
@@ -256,7 +263,7 @@ Where:
 |----------|---------|
 | **Xf** | Log value of the final filament in the series |
 | **k** | Tabulated statistic determined by the x/o response pattern |
-| **d** (delta) | Mean log interval between filaments = 0.4414 |
+| **d** (delta) | Legacy: 0.441428571; rat/custom: mean adjacent interval in the selected ladder’s log column |
 
 The log value of each filament is computed from its force as: `Log = log10(10 * force_in_grams * 1000)`.
 
@@ -277,7 +284,7 @@ This file ships with the repository in the `data/` folder and contains two looku
    | 7 | 2.0410 | 4.31 | 2.000 |
    | 8 | 5.4950 | 4.74 | 6.000 |
 
-   ⚠️ **Filament 4 only:** the `Log` value stored in the Excel file (3.22) does not match the value obtained from the standard formula using the listed force (see below).
+   ⚠️ **Filaments 4 and 5:** stored `Log` values differ from logs recomputed from the listed forces (see below). The bundled calibration is retained for compatibility.
 
 2. **k-statistic lookup table** — 248 entries mapping every possible x/o response pattern (2 to 9 characters) to its corresponding k value. For example: `OX → -0.500`, `OXOOXO → 0.168`, `OOXXOO → 0.000`.
 
@@ -292,13 +299,13 @@ The original `VF_Calculator_Up-down.xlsx` spreadsheet stores a `Log` column for 
 | `Log` column in Excel | **3.22** |
 | Computed from force: `log10(10 × 0.158 × 1000)` | **3.199** (`Log_new`) |
 
-All other filaments match between `Log` and `Log_new` (to three decimal places). Because the 50% threshold formula uses the log of the **final filament**, sessions ending on filament 4 will give slightly different thresholds depending on which column you choose.
+Filament 5 also differs substantially: its listed force is 0.178 g (`Log_new` = 3.250), while its stored `Log` is 3.61. Other entries can differ slightly due to rounding. Changing log columns can therefore change thresholds, especially for filament 5. This tool preserves the reference values; confirm laboratory calibration before interpreting discrepancies.
 
 The tool therefore offers two options:
 
 | Option | Description | When to use |
 |--------|-------------|-------------|
-| **`Log_new`** (default) | Recomputed from each filament’s force using the formula above | **Recommended** — corrects the filament 4 error |
+| **`Log_new`** (default) | Recomputed from each filament’s force using the formula above | Use when the listed forces are the intended calibration |
 | **`Log`** | Values copied from the original Excel `Log` column | Only if you need **bit-for-bit compatibility** with older analyses or the legacy Excel calculator |
 
 Select in **Step 1** of the GUI, or with `--log-column Log_new` / `--log-column Log` in CLI mode.
@@ -316,7 +323,7 @@ An Excel (`.xlsx`) or CSV file with one row per mouse per timepoint per experime
 | `mouse` | Unique animal identifier | `1441` |
 | *timepoint column* | Timepoint label (any column name) — numeric (days) or categorical (text) | `-1`, `3`, `14` or `pre`, `post` |
 | `xo_series` | String of `x` (withdraw) and `o` (no withdraw) characters | `oxooxo` |
-| `last_filament` | Integer number (1–8) of the final filament in the series | `5` |
+| `last_filament` | Integer ID of the final filament in the selected ladder (1–8 for legacy/rat; custom CSV IDs otherwise) | `5` |
 
 The timepoint column can have any name. You map it in the GUI.
 
@@ -485,6 +492,8 @@ The status line reports how many figures will be generated and whether pre/post 
 |----------|-------------|---------|
 | *(no flags)* | Launch the GUI | — |
 | `--compute` | Run threshold computation only (no GUI) | — |
+| `--filament-set` | `legacy`, `rat`, or `custom` | `legacy` |
+| `--custom-filaments` | Calibrated CSV ladder; required only for `custom` | — |
 | `--data` | Path to von Frey data file (required with `--compute`) | — |
 | `--metadata` | Path to metadata file (optional) | — |
 | `--filament-ref` | Path to filament reference file | `data/VF_Calculator_Up-down.xlsx` |
