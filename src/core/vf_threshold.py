@@ -28,6 +28,25 @@ INITIAL_FILAMENT: int = 4
 
 FILAMENT_SETS = ("legacy", "rat", "custom")
 RAT_REFERENCE = Path(__file__).resolve().parents[2] / "data" / "filaments_rat.csv"
+K_REFERENCE = Path(__file__).resolve().parents[2] / "data" / "dixon_k.csv"
+
+
+def spacing_warning(filament_info: pd.DataFrame, log_column: str = "Log_new") -> str:
+    """Describe ladders outside Dixon's approximate equal-step condition."""
+    intervals = np.diff(filament_info[log_column].to_numpy(dtype=float))
+    mean = float(intervals.mean())
+    deviation = float(np.max(np.abs(intervals / mean - 1)))
+    if deviation > 0.5 + 1e-12:
+        return (f"Uneven log spacing: an interval differs from the mean by {deviation:.1%} "
+                "(more than 50%). The mean-spacing Dixon estimate may be unreliable. "
+                "Review the experimental ladder/method; see docs/references.md.")
+    return ""
+
+
+def load_k_statistics() -> dict[str, float]:
+    """Species-independent Dixon coefficients, transcribed from the legacy table."""
+    table = pd.read_csv(K_REFERENCE)
+    return dict(zip(table["OBSERVATION"], table["STATISTIC"]))
 
 
 def load_filament_set(filepath: Union[str, Path]) -> pd.DataFrame:
@@ -91,7 +110,7 @@ def calculate_log(force_grams: float) -> float:
 
 
 def load_filament_reference(
-    filepath: Union[str, Path],
+    filepath: Union[str, Path, None] = None,
     sheet_name: str = "values_analysis",
     *,
     filament_set: str = "legacy",
@@ -100,11 +119,11 @@ def load_filament_reference(
     """Load filament reference data and series statistics from the VF Calculator file.
 
     Args:
-        filepath: Path to VF_Calculator_Up-down.xlsx.
+        filepath: Mouse master path; ignored for rat/custom (no Excel needed).
         sheet_name: Name of the sheet containing values_analysis data.
         filament_set: 'legacy' (unchanged workbook), 'rat', or 'custom'.
-        custom_filaments: CSV ladder required for 'custom'; k values still
-            come from the unmodified workbook.
+        custom_filaments: CSV ladder required for 'custom'; rat/custom k values
+            come from the standalone, species-independent dixon_k.csv.
 
     Returns:
         Tuple of (filament_info DataFrame, series_statistics dict).
@@ -119,6 +138,12 @@ def load_filament_reference(
         raise ValueError("Custom filament set requires a filament CSV path.")
     if filament_set != "custom" and custom_filaments:
         raise ValueError("A custom filament CSV can only be used with the custom set.")
+    if filament_set != "legacy":
+        info = load_filament_set(RAT_REFERENCE if filament_set == "rat" else custom_filaments)
+        info.attrs["filament_set"] = filament_set
+        return info, load_k_statistics()
+    if filepath is None:
+        filepath = Path(__file__).resolve().parents[2] / "data/VF_Calculator_Up-down.xlsx"
     filepath = Path(filepath)
     if not filepath.exists():
         raise FileNotFoundError(f"Filament reference file not found: {filepath}")
@@ -138,11 +163,6 @@ def load_filament_reference(
     observations = df_obs_statistics["OBSERVATION"].tolist()
     statistics = df_obs_statistics["STATISTIC"].tolist()
     dict_obs_stat: dict[str, float] = dict(zip(observations, statistics))
-
-    if filament_set != "legacy":
-        info = load_filament_set(RAT_REFERENCE if filament_set == "rat" else custom_filaments)
-        info.attrs["filament_set"] = filament_set
-        return info, dict_obs_stat
 
     # Load filament information (columns G:K, 8 rows of filament data)
     df_filament_info = pd.read_excel(
@@ -190,6 +210,8 @@ def compute_50_threshold(
     """
     if delta is None:
         delta = get_delta(filament_info, log_column)
+    if filament_info.attrs.get("filament_set") == "rat" and log_column != "Log_new":
+        raise ValueError("Rat thresholds use Log_new calculated from force; no rat master workbook is used.")
     if not np.isfinite(delta) or delta <= 0:
         raise ValueError("Delta must be finite and positive.")
     if not isinstance(series, str) or len(series) == 0:
@@ -264,3 +286,93 @@ def compute_thresholds_batch(
         ),
         axis=1,
     )
+
+
+BOUNDARY_POLICIES = ("flag", "endpoints", "exclude")
+
+
+def compute_threshold_report(
+    df: pd.DataFrame,
+    filament_info: pd.DataFrame,
+    series_statistics: dict[str, float],
+    series_col: str = "xo_series",
+    filament_col: str = "last_filament",
+    log_column: str = "Log_new",
+    boundary_policy: str = "flag",
+) -> pd.DataFrame:
+    """Calculate estimates and preserve boundary/invalid observations explicitly.
+
+    A uniform response run ending at its directional endpoint is a boundary
+    observation, not a Dixon point estimate. 'endpoints' is an explicit numerical
+    substitution; 'flag' and 'exclude' retain NaN but distinguish user intent.
+    Mixed-response estimates outside the ladder are reported without clamping.
+    This does not validate a study's starting filament or stopping rule.
+    """
+    if boundary_policy not in BOUNDARY_POLICIES:
+        raise ValueError(f"Unknown boundary policy: {boundary_policy}")
+    result = df.copy()
+    result["threshold_50"] = compute_thresholds_batch(
+        df, filament_info, series_statistics, series_col, filament_col, log_column
+    )
+    ids = filament_info["Filament_number"].tolist()
+    low = float(10 ** filament_info[log_column].iloc[0] / 10000)
+    high = float(10 ** filament_info[log_column].iloc[-1] / 10000)
+    statuses, limits, values = [], [], []
+    for series, fid, value in zip(df[series_col], df[filament_col], result["threshold_50"]):
+        status, limit = "estimated", np.nan
+        if pd.isna(fid) or fid not in ids:
+            status = "unknown_filament"
+        elif not isinstance(series, str) or not series or set(series.upper()) - set("XO"):
+            status = "invalid_series"
+        elif len(set(series.upper())) == 1:
+            if len(series) > len(ids):
+                status = "invalid_boundary_history"
+            elif series.upper()[0] == "X" and fid == ids[0]:
+                status, limit = "below_range", low
+            elif series.upper()[0] == "O" and fid == ids[-1]:
+                status, limit = "above_range", high
+            else:
+                status = "incomplete_no_reversal"
+            value = limit if np.isfinite(limit) and boundary_policy == "endpoints" else np.nan
+        elif pd.isna(value):
+            status = "unsupported_pattern"
+        elif value < low:
+            status = "estimate_below_range"
+        elif value > high:
+            status = "estimate_above_range"
+        statuses.append(status)
+        limits.append(limit)
+        values.append(value)
+    result["threshold_50"] = values
+    result["vf_status"] = statuses
+    result["vf_boundary_limit_g"] = limits
+    result["vf_boundary_policy"] = boundary_policy
+    result["vf_filament_set"] = filament_info.attrs.get("filament_set", "legacy")
+    result["vf_log_column"] = log_column
+    result["vf_delta"] = get_delta(filament_info, log_column)
+    return result
+
+
+def boundary_summary(df: pd.DataFrame) -> str:
+    """Human-readable accounting suitable for plots, logs, and statistics."""
+    if "vf_status" not in df:
+        return ""
+    counts = df["vf_status"].value_counts()
+    lower, upper = int(counts.get("below_range", 0)), int(counts.get("above_range", 0))
+    invalid = int(df["vf_status"].isin([
+        "invalid_series", "unknown_filament", "invalid_boundary_history",
+        "incomplete_no_reversal", "unsupported_pattern",
+    ]).sum())
+    outside = int(df["vf_status"].isin(["estimate_below_range", "estimate_above_range"]).sum())
+    if not (lower or upper or invalid or outside):
+        return ""
+    policy = ", ".join(sorted(df["vf_boundary_policy"].dropna().unique()))
+    return (f"Boundary observations: {lower} below / {upper} above range; policy: {policy}. "
+            f"Invalid/incomplete: {invalid}; outside-range estimates (not clamped): {outside}.")
+
+
+def unresolved_boundaries(df: pd.DataFrame) -> bool:
+    return bool("vf_status" in df and (
+        df["vf_status"].isin(["below_range", "above_range"])
+        & df["vf_boundary_policy"].eq("flag")
+    ).any())

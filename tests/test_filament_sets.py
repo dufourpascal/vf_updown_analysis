@@ -53,14 +53,14 @@ class FilamentSetTests(unittest.TestCase):
 
     def test_rat_mapping_delta_and_known_result(self):
         info, stats = load_filament_reference(REFERENCE, filament_set='rat')
-        self.assertEqual(info['Log'].tolist(), [3.61, 3.84, 4.08, 4.31, 4.56, 4.74, 4.93, 5.18])
+        self.assertEqual(info['Handle_code'].tolist(), [3.61, 3.84, 4.08, 4.31, 4.56, 4.74, 4.93, 5.18])
         self.assertEqual(info.Filament_number.tolist(), list(range(1, 9)))
         self.assertEqual(stats['OX'], -0.5)
-        for column in ['Log', 'Log_new']:
-            self.assertAlmostEqual(get_delta(info, column), 1.57 / 7)
-            expected = 10 ** (5.18 - 0.5 * (1.57 / 7)) / 10000
+        for column in ['Log_new']:
+            self.assertAlmostEqual(get_delta(info, column), math.log10(15/.4) / 7)
+            expected = 15 * 10 ** (-0.5 * (math.log10(15/.4) / 7))
             self.assertAlmostEqual(compute_50_threshold('ox', 8, info, stats, column), expected)
-        self.assertAlmostEqual(info['Force (g)'].iloc[-1], 15.1356124843621)
+        self.assertAlmostEqual(info['Force (g)'].iloc[-1], 15.0)
 
     def test_custom_more_than_eight_and_preserved_ids(self):
         self.csv('Filament_number,Force (g)\n' + ''.join(f'{i*10},{2**i}\n' for i in range(1, 11)))
@@ -102,9 +102,9 @@ class FilamentSetTests(unittest.TestCase):
         for delta in [0, -1, np.nan, np.inf]:
             with self.subTest(delta=delta), self.assertRaises(ValueError):
                 compute_50_threshold('OX', 4, info, stats, delta=delta)
-        self.assertAlmostEqual(compute_50_threshold('OX', 4, info, stats, delta=.2), 10**4.21/10000)
+        self.assertAlmostEqual(compute_50_threshold('OX', 4, info, stats, delta=.2), 2 * 10**(-.1))
         result = compute_thresholds_batch(pd.DataFrame({'xo_series':['OX'], 'last_filament':[4]}), info, stats, delta=.2)
-        self.assertAlmostEqual(result.iloc[0], 10**4.21/10000)
+        self.assertAlmostEqual(result.iloc[0], 2 * 10**(-.1))
 
     def test_session_compatibility(self):
         self.assertEqual(AnalysisState.from_json('{}').filament_set, 'legacy')
@@ -134,7 +134,7 @@ class FilamentSetTests(unittest.TestCase):
             result = subprocess.run(args, cwd=self.temp.name, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             output = pd.read_excel(Path(self.temp.name)/'vf_thresholds.xlsx')
-            expected = 10**(5.18-.5*1.57/7)/10000 if profile == 'rat' else 8/math.sqrt(2)
+            expected = 15 * 10**(-.5*math.log10(15/.4)/7) if profile == 'rat' else 8/math.sqrt(2)
             self.assertAlmostEqual(output.threshold_50.iloc[0], expected)
             self.assertEqual(output.vf_filament_set.iloc[0], profile)
             self.assertEqual(output.vf_log_column.iloc[0], 'Log_new')
@@ -157,7 +157,7 @@ class GuiFilamentTests(unittest.TestCase):
         self.addCleanup(panel.close)
         panel.filament_set_combo.setCurrentIndex(1)
         self.assertEqual(state.filament_set, 'rat')
-        self.assertIn('0.224285714', panel.filament_status.text())
+        self.assertIn('0.224861610', panel.filament_status.text())
         worker = ThresholdWorker(pd.DataFrame({'xo_series':['OX'], 'last_filament':[8]}),
                                  state._filament_info, state._series_stats, 'xo_series', 'last_filament', 'Log_new')
         results, errors = [], []
@@ -165,16 +165,18 @@ class GuiFilamentTests(unittest.TestCase):
         worker.error.connect(errors.append)
         worker.run()
         self.assertFalse(errors)
-        self.assertAlmostEqual(results[0].threshold_50.iloc[0], 10**(5.18-.5*1.57/7)/10000)
+        self.assertAlmostEqual(results[0].threshold_50.iloc[0], 15 * 10**(-.5*math.log10(15/.4)/7))
         self.assertEqual(results[0].vf_filament_set.iloc[0], 'rat')
         panel.filament_set_combo.setCurrentIndex(2)
         self.assertIsNone(state._filament_info)  # Cannot reuse previous valid ladder.
         self.assertFalse(panel.compute_btn.isEnabled())
         panel.state = AnalysisState(filament_ref_path=str(REFERENCE), filament_set='rat', log_column='Log')
         panel.restore_filament_settings()
-        self.assertTrue(panel.log_old_radio.isChecked())
-        self.assertEqual(panel.state.log_column, 'Log')
+        self.assertTrue(panel.log_new_radio.isChecked())
+        self.assertFalse(panel.log_old_radio.isEnabled())
+        self.assertEqual(panel.state.log_column, 'Log_new')
         self.assertEqual(panel.filament_set_combo.currentData(), 'rat')
+        panel.filament_set_combo.setCurrentIndex(0)
         panel._load_filament_ref('/missing.xlsx')
         self.assertIsNone(panel.state._filament_info)
         self.assertFalse(panel.compute_btn.isEnabled())
